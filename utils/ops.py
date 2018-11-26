@@ -24,3 +24,11 @@ def mean(tensor, dim=None, keepdim=False):
     dims = torch.Tensor([shape[d] for d in dim])
     return torch.sum(tensor, dim=dim, keepdim=keepdim) / torch.prod(dims)
 
+
+def create_covariance_matrix(diags):
+    shape = diags.shape
+
+    covariance_matrix = torch.zeros(shape[0], shape[1], shape[1])
+    for idx, diag in enumerate(diags):
+        covariance_matrix[idx, range(shape[1]), range(shape[1])] = diag
+    return covariance_matrix

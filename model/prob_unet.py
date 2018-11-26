@@ -2,13 +2,19 @@ import torch
 import torch.nn as nn
 
 from torch.nn import Module, init
+from torch.distributions.multivariate_normal import MultivariateNormal
 
-from utils.ops import truncated_normal
+from utils.ops import *
+
+
+initializers={'w': init.kaiming_normal_, 'b': lambda b: truncated_normal(b, std=1e-3)}
+down_sampling_op = nn.AvgPool2d(kernel_size=2, stride=2)
+# up_sampling_op = UpSampling()
 
 
 def down_block(in_channels, out_channels, kernel_size=3, stride=1, padding=1, num_convs=2,
                initializers=None, nonlinearity=nn.ReLU,
-               down_sample_input=True, down_sampling_op=nn.AvgPool2d(kernel_size=2, stride=2)):
+               down_sample_input=True, down_sampling_op=down_sampling_op, device='cpu'):
     features = []
 
     if down_sample_input:
@@ -16,7 +22,7 @@ def down_block(in_channels, out_channels, kernel_size=3, stride=1, padding=1, nu
 
     for i in range(num_convs):
         in_ch = in_channels if i == 0 else out_channels
-        features.append(Conv2d(in_ch, out_channels, kernel_size, stride, padding, initializers=initializers))
+        features.append(Conv2d(in_ch, out_channels, kernel_size, stride, padding, initializers=initializers, device=device))
         features.append(nonlinearity(inplace=True))
 
     return nn.Sequential(*features)
@@ -24,7 +30,7 @@ def down_block(in_channels, out_channels, kernel_size=3, stride=1, padding=1, nu
 
 class Conv2d(nn.Conv2d):
 
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, initializers=None, **kwargs):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, initializers=None, device='cpu', **kwargs):
         nn.Conv2d.__init__(self, in_channels, out_channels, kernel_size, stride, padding, **kwargs)
 
         if initializers is not None:
@@ -32,6 +38,8 @@ class Conv2d(nn.Conv2d):
                 initializers['w'](self.weight)
             if 'b' in initializers:
                 initializers['b'](self.bias)
+        
+        self.to(device=device)
 
 
 class UpSampling(Module):
@@ -51,8 +59,7 @@ class UpSampling(Module):
 class Encoder(Module):
 
     def __init__(self, num_channels, nonlinearity=nn.ReLU, num_convs=3,
-                 initializers={'w': init.kaiming_normal_, 'b': lambda b: truncated_normal(b, std=1e-3)},
-                 down_sampling_op=nn.AvgPool2d(kernel_size=2, stride=2)):
+                 initializers=initializers, down_sampling_op=down_sampling_op, device='cpu'):
         Module.__init__(self)
         self._num_channels = num_channels
 
@@ -64,10 +71,12 @@ class Encoder(Module):
                 down_sample = True
 
             features.append(down_block(in_channels, out_channels,
+                                       num_convs=num_convs,
                                        nonlinearity=nonlinearity,
                                        initializers=initializers,
                                        down_sample_input=down_sample,
-                                       down_sampling_op=down_sampling_op))
+                                       down_sampling_op=down_sampling_op,
+                                       device=device))
 
         self.features = features
 
@@ -82,8 +91,7 @@ class Encoder(Module):
 class Decoder(Module):
 
     def __init__(self, num_channels, num_classes, nonlinearity=nn.ReLU, num_convs=3,
-                 initializers={'w': init.kaiming_normal_, 'b': lambda b: truncated_normal(b, std=1e-3)},
-                 up_sampling_op=UpSampling()):
+                 initializers=initializers, up_sampling_op=down_sampling_op, device='cpu'):
 
         Module.__init__(self)
 
@@ -95,7 +103,7 @@ class Decoder(Module):
             for i in range(num_convs):
                 in_ch = in_channels + out_channels if i == 0 else in_channels
                 feature.append(
-                    Conv2d(in_ch, in_channels, kernel_size=3, stride=1, padding=1, initializers=initializers))
+                    Conv2d(in_ch, in_channels, kernel_size=3, stride=1, padding=1, initializers=initializers, device=device))
                 feature.append(nonlinearity(inplace=True))
             features.append(nn.Sequential(*feature))
 
@@ -111,4 +119,77 @@ class Decoder(Module):
 
         return lower_res_features
 
+
+class UNet(Module):
+
+    def __init__(self, num_channels, num_classes, nonlinearity=nn.ReLU, num_convs=3, initializers=initializers,
+                 down_sampling_op=down_sampling_op, up_sampling_op=UpSampling(), device='cpu'):
+        Module.__init__(self)
+
+        self.encoder = Encoder(num_channels, nonlinearity, num_convs, initializers, down_sampling_op, device)
+        self.decoder = Decoder(num_channels, num_classes, nonlinearity, num_convs, initializers, up_sampling_op, device)
+
+    def forward(self, inputs):
+        encoder_features = self.encoder(inputs)
+        predicted_logits = self.decoder(encoder_features)
+        return predicted_logits
+
+
+class Prior(Module):
+
+    def __init__(self, latent_dim, num_channels, nonlinearity=nn.ReLU, num_convs=3, initializers=initializers,
+                 down_sampling_op=down_sampling_op, device='cpu'):
+        Module.__init__(self)
+
+        self.latent_dim = latent_dim
+
+        self._encoder = Encoder(num_channels, nonlinearity, num_convs, initializers, down_sampling_op, device)
+        self._conv2d = Conv2d(num_channels[-1], 2 * latent_dim, kernel_size=1, stride=1, padding=0,
+                              initializers=initializers, device=device)
+
+    def forward(self, input):
+        encoding = self._encoder(input)[-1]
+        encoding = mean(encoding, dim=[2, 3], keepdim=True)
+
+        mu_log_sigma = torch.squeeze(self._conv2d(encoding))
+        mu = mu_log_sigma[:, :self.latent_dim]
+        sigma = torch.exp(mu_log_sigma[:, self.latent_dim:])
+        covariance_matrix = create_covariance_matrix(sigma)
+
+        multivariate_normal = MultivariateNormal(mu, covariance_matrix)
+        return multivariate_normal
+
+
+class Posterior(Prior):
+
+    def __init__(self, latent_dim, num_channels, nonlinearity=nn.ReLU, num_convs=3, initializers=initializers,
+                 down_sampling_op=down_sampling_op):
+        Prior.__init__(self, latent_dim, num_channels, nonlinearity, num_convs, initializers, down_sampling_op)
+
+    def forward(self, input, segment):
+        input = torch.cat([input, segment], dim=1)
+        return super().forward(input)
+
+
+class Conv1x1Decoder(Module):
+
+    def __init__(self, in_channels, out_channels, num_classes, num_convs, nonlinearity=nn.ReLU,
+                 initializers=initializers, device='cpu'):
+        Module.__init__(self)
+
+        features = []
+        features.append(
+            Conv2d(in_channels, out_channels, kernel_size=1, stride=1, initializers=initializers, device=device))
+        features.append(nonlinearity(inplace=True))
+
+        for _ in range(num_convs - 1):
+            features.append(
+                Conv2d(out_channels, out_channels, kernel_size=1, stride=1, initializers=initializers, device=device))
+            features.append(nonlinearity(inplace=True))
+
+        features.append(Conv2d(out_channels, num_classes, kernel_size=1, initializers=initializers, device=device))
+        self.net = nn.Sequential(*features)
+
+    def forward(self, features, z):
+        pass
 

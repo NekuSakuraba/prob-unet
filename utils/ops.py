@@ -15,3 +15,12 @@ def truncated_normal(tensor, mean=0., std=1.):
     with torch.no_grad():
         tensor.copy_(sample)
 
+
+def mean(tensor, dim=None, keepdim=False):
+    if dim is None:
+        return torch.mean(tensor, keepdim=keepdim)
+
+    shape = tensor.shape
+    dims = torch.Tensor([shape[d] for d in dim])
+    return torch.sum(tensor, dim=dim, keepdim=keepdim) / torch.prod(dims)
+

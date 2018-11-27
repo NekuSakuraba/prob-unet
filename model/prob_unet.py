@@ -1,3 +1,5 @@
+import numpy as np
+
 import torch
 import torch.nn as nn
 
@@ -163,8 +165,8 @@ class Prior(Module):
 class Posterior(Prior):
 
     def __init__(self, latent_dim, num_channels, nonlinearity=nn.ReLU, num_convs=3, initializers=initializers,
-                 down_sampling_op=down_sampling_op):
-        Prior.__init__(self, latent_dim, num_channels, nonlinearity, num_convs, initializers, down_sampling_op)
+                 down_sampling_op=down_sampling_op, device='cpu'):
+        Prior.__init__(self, latent_dim, num_channels, nonlinearity, num_convs, initializers, down_sampling_op, device)
 
     def forward(self, input, segment):
         input = torch.cat([input, segment], dim=1)
@@ -191,5 +193,31 @@ class Conv1x1Decoder(Module):
         self.net = nn.Sequential(*features)
 
     def forward(self, features, z):
-        pass
+        shape = features.shape
 
+        z = z.view(-1, 1).repeat(1, np.prod(shape[2:])).view(shape[0], -1, shape[2], shape[3])
+        features = torch.cat([features, z], dim=1)
+
+        return self.net(features)
+
+
+class ProbUNet(Module):
+
+    def __init__(self, latent_dim, in_img_ch, in_seg_ch, num_channels, num_classes, num_1x1_convs=3,
+                 num_convs_per_block=3, nonlinearity=nn.ReLU,
+                 initializers=initializers, down_sampling_op=down_sampling_op, up_sampling_op=UpSampling(),
+                 device='cpu'):
+        Module.__init__(self)
+
+        self._unet = UNet([in_img_ch] + num_channels, num_classes, nonlinearity, num_convs_per_block, initializers,
+                          down_sampling_op, up_sampling_op, device)
+        self._f_comb = Conv1x1Decoder(num_channels[1] + num_channels[-1], num_channels[0], num_classes, num_1x1_convs,
+                                      nonlinearity, initializers, device)
+
+        self._prior = Prior(latent_dim, [in_img_ch] + num_channels, nonlinearity, num_convs_per_block, initializers,
+                            down_sampling_op, device)
+        self._posterior = Posterior(latent_dim, [in_img_ch + in_seg_ch] + num_channels, nonlinearity,
+                                    num_convs_per_block, initializers, down_sampling_op, device)
+
+    def forward(self, inputs):
+        pass
